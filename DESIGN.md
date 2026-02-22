@@ -119,9 +119,10 @@ New NATS message on pattern.monitor.{subject}
 
 ### Warm-up behaviour
 
-For the first `MIN_SAMPLES` messages (default 30), confidence is always emitted
-as `0.5` and the `hitl_required` flag is set to `true`. This bootstraps the
-rolling statistics safely before the classifier starts making assertions.
+For the first `MIN_SAMPLES` messages (default 30), `classification` is emitted
+as `"WARMING_UP"` and `confidence` is `0.5`. The `hitl_required` flag is set
+to `false` — the component does not escalate during warm-up because there is
+no anomaly to review; it is purely accumulating baseline statistics.
 
 ---
 
@@ -368,11 +369,152 @@ NATS: pattern.monitor.{subject}
 
 ## Next Steps
 
-1. **Confirm this design** — reply with any changes or constraints.
-2. **Implement Phase 1** — the classifier component scaffold, WIT world,
-   WADM manifest, unit tests, and integration test.
+1. ~~**Confirm this design**~~ ✅
+2. ~~**Implement Phase 1**~~ ✅ — implemented in `component/src/lib.rs`; 22 unit tests pass.
 3. **Validate Phase 1** end-to-end against a running encoder in a local
    wasmCloud host.
 4. **Layer Phase 2** once Phase 1 is stable and producing useful signals.
 5. **Evaluate Phase 3** need based on observed HITL escalation rate from
    Phase 1+2 in production.
+
+---
+
+## Phase 2 — Sliding-Window Temporal Drift Detection
+*(Implementation Guide — ready to code once Phase 1 is validated in production)*
+
+### Goal
+
+Detect **temporal** patterns that Phase 1 structurally cannot catch:
+
+| Pattern | Why Phase 1 misses it | What Phase 2 sees |
+|---------|-----------------------|-------------------|
+| Gradual drift | No single message has a high Z-score | Window bundle drifts steadily from prior window |
+| Regime change | Both regimes are internally "normal" | Sharp jump in inter-window cosine distance |
+| Temporal clustering | Anomaly only exists as a sequence | Repeated pattern emerges in window bundle |
+
+### New Files / Changes
+
+| Path | Change |
+|------|--------|
+| `component/src/lib.rs` | Add `classify_temporal()` called after Phase 1 in `handle_message` |
+| `wadm.yaml` | No change — same capability links |
+| `component/Cargo.toml` | No new dependencies |
+
+### New Redis Keys
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `window:ring:{subject}:head` | u64 (LE bytes) | Ring-buffer write pointer |
+| `window:ring:{subject}:size` | u64 (LE bytes) | Current fill count (0 → WINDOW_N) |
+| `window:slot:{subject}:{i}` | SparseVec (bincode) | Bundle stored at ring slot `i` |
+| `window:drift:{subject}:history` | `Vec<f32>` (bincode) | Last W drift values for slope |
+
+### Algorithm
+
+```
+WINDOW_N   = 20   // messages per window
+DRIFT_WARN = 0.30 // drift above this is "high"
+SLOPE_WARN = 0.02 // drift_rate above this is "accelerating"
+
+fn classify_temporal(bucket, subject, new_bundle) -> TemporalResult:
+    head = load_u64(bucket, "window:ring:{subject}:head")
+    size = load_u64(bucket, "window:ring:{subject}:size")
+
+    // Store the new bundle in the ring slot
+    slot_key = "window:slot:{subject}:{head % WINDOW_N}"
+    save_vec(bucket, slot_key, new_bundle)
+    head += 1
+    size = min(size + 1, 2 * WINDOW_N)
+    save_u64(bucket, "window:ring:{subject}:head", head)
+    save_u64(bucket, "window:ring:{subject}:size", size)
+
+    // Need at least 2 full windows before computing drift
+    if size < 2 * WINDOW_N:
+        return TemporalResult { label: "temporal_warming_up", confidence: 0.5 }
+
+    // Build window_now = bundle of last WINDOW_N slots
+    window_now = bundle(load_vec(slot[head-WINDOW_N .. head]))
+
+    // Build window_prev = bundle of slots before that
+    window_prev = bundle(load_vec(slot[head-2*WINDOW_N .. head-WINDOW_N]))
+
+    // Drift = how much the current window has moved from the previous
+    drift = 1.0 - cosine(window_now, window_prev) as f32
+
+    // Maintain drift history for slope estimation
+    history = load_drift_history(bucket, subject)   // Vec<f32>
+    history.push(drift)
+    if history.len() > HISTORY_LEN (default 10):
+        history.remove(0)
+    save_drift_history(bucket, subject, &history)
+
+    // Estimate drift rate using simple linear regression slope
+    drift_rate = linear_slope(&history)
+
+    // Classify (pseudocode — Rust implementation will use if/else, not match,
+    // because Rust match arms cannot contain arbitrary boolean expressions)
+    if drift >= DRIFT_WARN && drift_rate >= SLOPE_WARN:
+        (label, confidence) = ("regime_change",       0.88)
+    else if drift >= DRIFT_WARN:
+        (label, confidence) = ("gradual_trend_shift", 0.75)
+    else if drift_rate >= SLOPE_WARN:
+        (label, confidence) = ("emerging_trend",      0.60)
+    else:
+        (label, confidence) = ("temporal_normal",     0.95)
+
+    TemporalResult { label, confidence, drift, drift_rate }
+```
+
+### Integration into `handle_message`
+
+Phase 2 runs **after** Phase 1 inside the same `handle_message` call. The Phase 1
+`ClassifyResult` gains two optional fields:
+
+```rust
+pub struct ClassifyResult {
+    // ... existing Phase 1 fields ...
+    pub temporal_label:      Option<String>,  // Phase 2 temporal classification
+    pub temporal_confidence: Option<f32>,     // Phase 2 confidence
+}
+```
+
+The combined output merges both solutions arrays:
+
+```json
+{
+  "classification": "ANOMALY",
+  "confidence": 0.88,
+  "solutions": [
+    { "label": "field_spike:magnitude",  "confidence": 0.93, "source": "phase1" },
+    { "label": "regime_change",          "confidence": 0.88, "source": "phase2" },
+    { "label": "normal",                 "confidence": 0.07, "source": "phase1" }
+  ],
+  "phase": 2
+}
+```
+
+`hitl_required` fires if **either** phase is below `HITL_THRESHOLD`.
+
+### New Unit Tests to Add
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_ring_buffer_wrap_around` | Head pointer wraps at WINDOW_N correctly |
+| `test_window_bundle_warming_up` | Returns `temporal_warming_up` until 2×WINDOW_N messages |
+| `test_drift_zero_for_identical_windows` | Same bundles → drift ≈ 0 |
+| `test_drift_high_for_different_windows` | Very different bundles → drift near 1.0 |
+| `test_linear_slope_increasing` | Correctly detects upward slope in drift history |
+| `test_linear_slope_flat` | Returns slope ≈ 0 for flat history |
+| `test_classify_temporal_regime_change` | High drift + high rate → "regime_change" |
+| `test_classify_temporal_gradual` | High drift + low rate → "gradual_trend_shift" |
+| `test_classify_temporal_emerging` | Low drift + high rate → "emerging_trend" |
+| `test_classify_temporal_normal` | Low drift + low rate → "temporal_normal" |
+
+### Backwards Compatibility
+
+- Phase 2 writes only `window:*` keys — **never** modifies `stats:v1:*` or `ema:v1:*`
+- The `temporal_label` and `temporal_confidence` fields are `Option<...>` — Phase 1
+  consumers that don't know about Phase 2 simply ignore them
+- The `phase` field on every emission increments from `1` → `2` when Phase 2 is active,
+  so dashboards can track which phase resolved each classification
+

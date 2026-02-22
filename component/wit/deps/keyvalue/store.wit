@@ -1,0 +1,47 @@
+package wasi:keyvalue@0.2.0-draft;
+
+/// A keyvalue interface that provides eventually consistent key-value operations.
+interface store {
+    /// The set of errors which may be raised by functions in this package
+    variant error {
+        /// The host does not recognize the store identifier requested.
+        no-such-store,
+
+        /// The requesting component does not have access to the specified store
+        /// (which may or may not exist).
+        access-denied,
+
+        /// Some implementation-specific error has occurred (e.g. I/O)
+        other(string),
+    }
+
+    /// A response to a `list-keys` operation.
+    record key-response {
+        /// The list of keys returned by the query.
+        keys: list<string>,
+        /// The continuation token to use to fetch the next page of keys.
+        /// If this is `null`, then there are no more keys to fetch.
+        cursor: option<string>,
+    }
+
+    /// Get the bucket with the specified identifier.
+    open: func(identifier: string) -> result<bucket, error>;
+
+    /// A bucket is a collection of key-value pairs.
+    resource bucket {
+        /// Get the value associated with the specified `key`
+        get: func(key: string) -> result<option<list<u8>>, error>;
+
+        /// Set the value associated with the key in the store.
+        set: func(key: string, value: list<u8>) -> result<_, error>;
+
+        /// Delete the key-value pair associated with the key in the store.
+        delete: func(key: string) -> result<_, error>;
+
+        /// Check if the key exists in the store.
+        exists: func(key: string) -> result<bool, error>;
+
+        /// Get all defined keys in the store with an optional cursor (for pagination).
+        list-keys: func(cursor: option<string>) -> result<key-response, error>;
+    }
+}

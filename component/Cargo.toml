@@ -1,0 +1,26 @@
+[package]
+name = "pattern-classifier"
+version = "0.1.0"
+edition = "2021"
+description = "wasmCloud component that classifies patterns and anomalies in real-time from VSA hypervectors stored by the pattern-encoder, with human-in-the-loop escalation."
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# WIT bindings generator for wasmCloud component model
+wit-bindgen = "0.48"
+
+# JSON parsing for incoming message payloads and output serialisation
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Vector Symbolic Architecture: encode, bind, bundle, cosine similarity.
+# Note: the "simd" feature enables WASM SIMD128 which is only valid when
+# targeting wasm32; omitting it here keeps tests runnable on native x86_64.
+embeddenator-vsa = { version = "0.23", default-features = false }
+
+# I/O serialisation utilities: to_bincode / from_bincode for Redis persistence
+embeddenator-io = { version = "0.21", default-features = false }
