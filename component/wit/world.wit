@@ -1,0 +1,16 @@
+package wasmcloud:pattern-classifier;
+
+world pattern-classifier {
+    /// Structured logging via the host runtime
+    import wasi:logging/logging@0.1.0-draft;
+
+    /// Redis-backed key-value store for reading encoder vectors and persisting
+    /// classifier statistics
+    import wasi:keyvalue/store@0.2.0-draft;
+
+    /// Publish classification results and HITL alerts onto NATS
+    import wasmcloud:messaging/consumer@0.2.0;
+
+    /// Receive incoming JSON message streams and HITL human replies from NATS
+    export wasmcloud:messaging/handler@0.2.0;
+}

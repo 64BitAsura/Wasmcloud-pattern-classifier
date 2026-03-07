@@ -1,0 +1,75 @@
+apiVersion: core.oam.dev/v1beta1
+kind: Application
+metadata:
+  name: pattern-classifier-app
+  annotations:
+    version: v0.1.0
+    description: >
+      wasmCloud pattern-classifier (Phase 1): classifies patterns and anomalies
+      in real-time from streaming JSON messages using VSA cosine statistics and
+      per-field semantic drift detection, with human-in-the-loop escalation.
+spec:
+  components:
+    # ── Pattern-classifier component ─────────────────────────────────────────
+    - name: pattern-classifier
+      type: component
+      properties:
+        # file:// URL is intentional for local/CI builds; replace with an OCI
+        # registry reference (e.g. ghcr.io/...) for production deployments.
+        image: file://./component/build/pattern_classifier_s.wasm
+      traits:
+        - type: spreadscaler
+          properties:
+            instances: 1
+
+        # Link to Redis key-value provider (shared bucket with the encoder)
+        - type: link
+          properties:
+            target:
+              name: redis-keyvalue
+              config:
+                - name: keyvalue-config
+                  properties:
+                    url: redis://127.0.0.1:6379
+            namespace: wasi
+            package: keyvalue
+            interfaces: [store]
+
+        # Link to NATS messaging provider (component imports consumer.publish)
+        - type: link
+          properties:
+            target:
+              name: nats-messaging
+            namespace: wasmcloud
+            package: messaging
+            interfaces: [consumer]
+
+    # ── NATS messaging capability provider ──────────────────────────────────
+    - name: nats-messaging
+      type: capability
+      properties:
+        image: ghcr.io/wasmcloud/messaging-nats:0.23.1
+        id: nats-messaging
+      traits:
+        # Link from NATS provider to the classifier component (handler).
+        # The provider calls handle_message for each subscribed subject.
+        # Subscribes to both the stream topic and HITL reply topics.
+        - type: link
+          properties:
+            target:
+              name: pattern-classifier
+            namespace: wasmcloud
+            package: messaging
+            interfaces: [handler]
+            source:
+              config:
+                - name: messaging-config
+                  properties:
+                    subscriptions: "pattern.monitor.>, pattern.alert.human.*.reply"
+
+    # ── Redis key-value capability provider ─────────────────────────────────
+    - name: redis-keyvalue
+      type: capability
+      properties:
+        image: ghcr.io/wasmcloud/keyvalue-redis:0.28.2
+        id: redis-keyvalue

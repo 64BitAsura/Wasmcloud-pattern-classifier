@@ -1,0 +1,10 @@
+name = "Pattern Classifier Component"
+language = "rust"
+type = "component"
+
+[component]
+wasm_target = "wasm32-wasip2"
+wit_world = "pattern-classifier"
+build_command = "cargo build --release --target wasm32-wasip2"
+build_artifact = "target/wasm32-wasip2/release/pattern_classifier.wasm"
+destination = "build/pattern_classifier_s.wasm"
