@@ -37,6 +37,21 @@ pub(crate) const EPSILON: f32 = 1e-6;
 /// Maximum number of solutions returned in the classification output.
 pub(crate) const MAX_SOLUTIONS: usize = 5;
 
+// ── Phase 2 constants ─────────────────────────────────────────────────────────
+
+/// Number of bundles per sliding window.
+pub(crate) const WINDOW_N: usize = 20;
+
+/// Drift value above which the signal is considered "high".
+pub(crate) const DRIFT_WARN: f32 = 0.30;
+
+/// Drift rate (slope) above which drift is considered "accelerating".
+pub(crate) const SLOPE_WARN: f32 = 0.02;
+
+/// Number of recent drift values kept for linear regression.
+#[allow(dead_code)]
+pub(crate) const HISTORY_LEN: usize = 10;
+
 #[cfg(not(test))]
 /// Redis bucket shared with the encoder (both components use the same instance).
 pub(crate) const BUCKET_ID: &str = "pattern-monitor-vectors";
@@ -59,6 +74,7 @@ pub(crate) const REPLY_SUFFIX: &str = ".reply";
 pub struct Solution {
     pub label: String,
     pub confidence: f32,
+    pub source: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,6 +87,10 @@ pub struct ClassifyResult {
     pub message_count: u64,
     pub hitl_required: bool,
     pub phase: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temporal_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temporal_confidence: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -176,6 +196,7 @@ pub(crate) fn build_solutions(
             solutions.push(Solution {
                 label: format!("field_spike:{field_name}"),
                 confidence: (1.0 - score).clamp(0.0, 1.0),
+                source: "phase1".to_string(),
             });
         }
     }
@@ -184,12 +205,14 @@ pub(crate) fn build_solutions(
         solutions.push(Solution {
             label: "message_level_anomaly".to_string(),
             confidence: msg_confidence,
+            source: "phase1".to_string(),
         });
     }
 
     solutions.push(Solution {
         label: "normal".to_string(),
         confidence: (1.0 - msg_confidence).clamp(0.0, 1.0),
+        source: "phase1".to_string(),
     });
 
     solutions.sort_by(|a, b| {
@@ -199,6 +222,57 @@ pub(crate) fn build_solutions(
     });
     solutions.truncate(MAX_SOLUTIONS);
     solutions
+}
+
+// ── Phase 2: Temporal Layer ───────────────────────────────────────────────────
+
+/// Result of the Phase 2 temporal drift analysis.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct TemporalResult {
+    pub label: String,
+    pub confidence: f32,
+    pub drift: f32,
+    pub drift_rate: f32,
+}
+
+/// Compute the slope of a linear regression fit to `values` indexed by position.
+/// Returns `0.0` when fewer than 2 data points are available.
+pub(crate) fn linear_slope(values: &[f32]) -> f32 {
+    let n = values.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let n_f = n as f32;
+    let mut sum_x: f32 = 0.0;
+    let mut sum_y: f32 = 0.0;
+    let mut sum_xy: f32 = 0.0;
+    let mut sum_x2: f32 = 0.0;
+    for (i, &y) in values.iter().enumerate() {
+        let x = i as f32;
+        sum_x += x;
+        sum_y += y;
+        sum_xy += x * y;
+        sum_x2 += x * x;
+    }
+    let denom = n_f * sum_x2 - sum_x * sum_x;
+    if denom.abs() < EPSILON {
+        return 0.0;
+    }
+    (n_f * sum_xy - sum_x * sum_y) / denom
+}
+
+/// Classify drift and drift_rate into a temporal label with confidence.
+pub(crate) fn classify_drift(drift: f32, drift_rate: f32) -> (&'static str, f32) {
+    if drift >= DRIFT_WARN && drift_rate >= SLOPE_WARN {
+        ("regime_change", 0.88)
+    } else if drift >= DRIFT_WARN {
+        ("gradual_trend_shift", 0.75)
+    } else if drift_rate >= SLOPE_WARN {
+        ("emerging_trend", 0.60)
+    } else {
+        ("temporal_normal", 0.95)
+    }
 }
 
 // ── wasmCloud component implementation (excluded from test builds) ─────────────
@@ -264,6 +338,131 @@ fn save_f32(bucket: &crate::wasi::keyvalue::store::Bucket, key: &str, val: f32) 
     let _ = bucket.set(key, &val.to_le_bytes());
 }
 
+/// Load a drift history vector from Redis (bincode-serialised `Vec<f32>`).
+#[cfg(not(test))]
+fn load_drift_history(bucket: &crate::wasi::keyvalue::store::Bucket, subject: &str) -> Vec<f32> {
+    let key = format!("window:drift:{subject}:history");
+    bucket
+        .get(&key)
+        .ok()
+        .flatten()
+        .and_then(|bytes| from_bincode::<Vec<f32>>(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Save drift history vector to Redis.
+#[cfg(not(test))]
+fn save_drift_history(
+    bucket: &crate::wasi::keyvalue::store::Bucket,
+    subject: &str,
+    history: &[f32],
+) {
+    let key = format!("window:drift:{subject}:history");
+    if let Ok(bytes) = to_bincode(&history.to_vec()) {
+        let _ = bucket.set(&key, &bytes);
+    }
+}
+
+/// Phase 2 temporal classification using sliding-window bundle drift.
+#[cfg(not(test))]
+fn classify_temporal(
+    bucket: &crate::wasi::keyvalue::store::Bucket,
+    subject: &str,
+    new_bundle: &SparseVec,
+) -> TemporalResult {
+    // ── Ring-buffer maintenance ──────────────────────────────────────────────
+    let head_key = format!("window:ring:{subject}:head");
+    let size_key = format!("window:ring:{subject}:size");
+
+    let head = load_u64(bucket, &head_key);
+    let size = load_u64(bucket, &size_key);
+
+    // Store the new bundle in the ring slot
+    let slot_index = (head as usize) % WINDOW_N;
+    let slot_key = format!("window:slot:{subject}:{slot_index}");
+    let _ = save_vec(bucket, &slot_key, new_bundle);
+
+    let new_head = head.wrapping_add(1);
+    let new_size = (size + 1).min(2 * WINDOW_N as u64);
+    save_u64(bucket, &head_key, new_head);
+    save_u64(bucket, &size_key, new_size);
+
+    // ── Warm-up gate: need at least 2 full windows ──────────────────────────
+    if new_size < 2 * WINDOW_N as u64 {
+        return TemporalResult {
+            label: "temporal_warming_up".to_string(),
+            confidence: 0.5,
+            drift: 0.0,
+            drift_rate: 0.0,
+        };
+    }
+
+    // ── Build window_now and window_prev from ring slots ────────────────────
+    let mut window_now_vecs: Vec<SparseVec> = Vec::with_capacity(WINDOW_N);
+    let mut window_prev_vecs: Vec<SparseVec> = Vec::with_capacity(WINDOW_N);
+
+    for i in 0..WINDOW_N {
+        // window_now: last WINDOW_N slots before new_head
+        let now_idx = ((new_head as usize)
+            .wrapping_sub(WINDOW_N - i)
+            .wrapping_sub(1))
+            % WINDOW_N;
+        let now_key = format!("window:slot:{subject}:{now_idx}");
+        if let Some(v) = load_vec(bucket, &now_key) {
+            window_now_vecs.push(v);
+        }
+
+        // window_prev: WINDOW_N slots before window_now
+        let prev_idx = ((new_head as usize)
+            .wrapping_sub(2 * WINDOW_N - i)
+            .wrapping_sub(1))
+            % WINDOW_N;
+        let prev_key = format!("window:slot:{subject}:{prev_idx}");
+        if let Some(v) = load_vec(bucket, &prev_key) {
+            window_prev_vecs.push(v);
+        }
+    }
+
+    // Bundle the windows
+    let window_now = window_now_vecs
+        .iter()
+        .skip(1)
+        .fold(window_now_vecs.first().cloned(), |acc, v| {
+            acc.map(|a| a.bundle(v))
+        });
+    let window_prev = window_prev_vecs
+        .iter()
+        .skip(1)
+        .fold(window_prev_vecs.first().cloned(), |acc, v| {
+            acc.map(|a| a.bundle(v))
+        });
+
+    // Compute drift
+    let drift = match (&window_now, &window_prev) {
+        (Some(now), Some(prev)) => (1.0 - now.cosine(prev) as f32).max(0.0),
+        _ => 0.0,
+    };
+
+    // ── Maintain drift history for slope estimation ─────────────────────────
+    let mut history = load_drift_history(bucket, subject);
+    history.push(drift);
+    if history.len() > HISTORY_LEN {
+        history.remove(0);
+    }
+    save_drift_history(bucket, subject, &history);
+
+    // ── Classify ────────────────────────────────────────────────────────────
+    let drift_rate = linear_slope(&history);
+    let (label, confidence) = classify_drift(drift, drift_rate);
+
+    TemporalResult {
+        label: label.to_string(),
+        confidence,
+        drift,
+        drift_rate,
+    }
+}
+
 /// Ingest a confirmed human classification reply and update the baseline stats.
 #[cfg(not(test))]
 fn handle_human_reply(
@@ -326,6 +525,8 @@ fn classify_message(
                 message_count: 0,
                 hitl_required: false,
                 phase: 1,
+                temporal_label: None,
+                temporal_confidence: None,
             });
         }
         Ok(f) => f,
@@ -376,6 +577,15 @@ fn classify_message(
             "pattern-classifier",
             &format!("warming up ({n}/{MIN_SAMPLES}) for '{subject}'"),
         );
+
+        // Phase 2: feed the ring buffer even during warm-up
+        let temporal = classify_temporal(bucket, subject, &new_bundle);
+        let (temporal_label, temporal_confidence) = if temporal.label == "temporal_warming_up" {
+            (None, None)
+        } else {
+            (Some(temporal.label), Some(temporal.confidence))
+        };
+
         return Ok(ClassifyResult {
             subject: subject.to_string(),
             classification: "WARMING_UP".to_string(),
@@ -383,6 +593,7 @@ fn classify_message(
             solutions: vec![Solution {
                 label: "warming_up".to_string(),
                 confidence: 0.5,
+                source: "phase1".to_string(),
             }],
             anomalous_fields: vec![],
             message_count: n,
@@ -390,6 +601,8 @@ fn classify_message(
             // skips the alert for WARMING_UP results (see handle_message).
             hitl_required: false,
             phase: 1,
+            temporal_label,
+            temporal_confidence,
         });
     }
 
@@ -466,29 +679,73 @@ fn classify_message(
 
     let solutions = build_solutions(is_msg_anomaly, msg_confidence, &field_results);
 
+    // ── Step 5: Phase 2 — temporal drift classification ───────────────────────
+    let temporal = classify_temporal(bucket, subject, &new_bundle);
+    let temporal_warming = temporal.label == "temporal_warming_up";
+
+    // Merge Phase 2 temporal solution into the solutions list
+    let mut merged_solutions = solutions;
+    if !temporal_warming {
+        merged_solutions.push(Solution {
+            label: temporal.label.clone(),
+            confidence: temporal.confidence,
+            source: "phase2".to_string(),
+        });
+        merged_solutions.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        merged_solutions.truncate(MAX_SOLUTIONS);
+    }
+
+    // Determine overall confidence and HITL requirement
+    let overall_confidence = if temporal_warming {
+        confidence
+    } else {
+        confidence.max(temporal.confidence)
+    };
+
+    let hitl_required = if temporal_warming {
+        confidence < HITL_THRESHOLD
+    } else {
+        confidence < HITL_THRESHOLD || temporal.confidence < HITL_THRESHOLD
+    };
+
+    let phase: u8 = if temporal_warming { 1 } else { 2 };
+
+    let (temporal_label, temporal_confidence) = if temporal_warming {
+        (None, None)
+    } else {
+        (Some(temporal.label), Some(temporal.confidence))
+    };
+
     log(
         Level::Info,
         "pattern-classifier",
         &format!(
-            "subject='{}' class={} conf={:.3} z={:.3} fields={} anomalous={:?}",
+            "subject='{}' class={} conf={:.3} z={:.3} fields={} anomalous={:?} phase={}",
             subject,
             classification,
-            confidence,
+            overall_confidence,
             z,
             field_results.len(),
-            anomalous_fields
+            anomalous_fields,
+            phase
         ),
     );
 
     Ok(ClassifyResult {
         subject: subject.to_string(),
         classification: classification.to_string(),
-        confidence,
-        solutions,
+        confidence: overall_confidence,
+        solutions: merged_solutions,
         anomalous_fields,
         message_count: n,
-        hitl_required: confidence < HITL_THRESHOLD,
-        phase: 1,
+        hitl_required,
+        phase,
+        temporal_label,
+        temporal_confidence,
     })
 }
 
@@ -771,5 +1028,129 @@ mod tests {
         let cross = v1.cosine(v2) as f32;
         let self_sim = v1.cosine(v1) as f32;
         assert!(cross < self_sim, "cross={cross} self_sim={self_sim}");
+    }
+
+    // ── Phase 2: linear_slope ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_linear_slope_increasing() {
+        // Monotonically increasing drift history → positive slope
+        let history = vec![0.0, 0.1, 0.2, 0.3, 0.4];
+        let slope = linear_slope(&history);
+        assert!(slope > 0.09, "slope should be ~0.1, got {slope}");
+    }
+
+    #[test]
+    fn test_linear_slope_flat() {
+        // Flat drift history → slope ≈ 0
+        let history = vec![0.5, 0.5, 0.5, 0.5, 0.5];
+        let slope = linear_slope(&history);
+        assert!(slope.abs() < 1e-5, "slope should be ~0, got {slope}");
+    }
+
+    #[test]
+    fn test_linear_slope_single_point() {
+        // Fewer than 2 points → 0.0
+        let history = vec![0.3];
+        let slope = linear_slope(&history);
+        assert_eq!(slope, 0.0);
+    }
+
+    #[test]
+    fn test_linear_slope_empty() {
+        let slope = linear_slope(&[]);
+        assert_eq!(slope, 0.0);
+    }
+
+    // ── Phase 2: classify_drift ───────────────────────────────────────────────
+
+    #[test]
+    fn test_classify_temporal_regime_change() {
+        let (label, conf) = classify_drift(0.40, 0.05);
+        assert_eq!(label, "regime_change");
+        assert!((conf - 0.88).abs() < 1e-5, "conf={conf}");
+    }
+
+    #[test]
+    fn test_classify_temporal_gradual() {
+        let (label, conf) = classify_drift(0.35, 0.01);
+        assert_eq!(label, "gradual_trend_shift");
+        assert!((conf - 0.75).abs() < 1e-5, "conf={conf}");
+    }
+
+    #[test]
+    fn test_classify_temporal_emerging() {
+        let (label, conf) = classify_drift(0.10, 0.05);
+        assert_eq!(label, "emerging_trend");
+        assert!((conf - 0.60).abs() < 1e-5, "conf={conf}");
+    }
+
+    #[test]
+    fn test_classify_temporal_normal() {
+        let (label, conf) = classify_drift(0.10, 0.01);
+        assert_eq!(label, "temporal_normal");
+        assert!((conf - 0.95).abs() < 1e-5, "conf={conf}");
+    }
+
+    // ── Phase 2: ring buffer / window logic ───────────────────────────────────
+
+    #[test]
+    fn test_ring_buffer_wrap_around() {
+        // Verify that head % WINDOW_N wraps correctly
+        for head in 0..(3 * WINDOW_N) {
+            let slot = head % WINDOW_N;
+            assert!(slot < WINDOW_N, "slot={slot} must be < WINDOW_N={WINDOW_N}");
+        }
+        // Specific wrap boundary
+        assert_eq!(WINDOW_N % WINDOW_N, 0);
+        assert_eq!((WINDOW_N + 1) % WINDOW_N, 1);
+        assert_eq!((2 * WINDOW_N - 1) % WINDOW_N, WINDOW_N - 1);
+    }
+
+    #[test]
+    fn test_drift_zero_for_identical_windows() {
+        // Two identical bundles → cosine ≈ 1.0, drift ≈ 0.0
+        let fields = encode_json_fields(br#"{"sensor":"temperature","value":"42"}"#).unwrap();
+        let bundle = build_master_bundle(&fields).unwrap();
+        let drift = 1.0 - bundle.cosine(&bundle) as f32;
+        assert!(
+            drift.abs() < 0.05,
+            "identical bundles should have drift ≈ 0, got {drift}"
+        );
+    }
+
+    #[test]
+    fn test_drift_high_for_different_windows() {
+        // Two very different bundles → lower cosine, higher drift
+        let f1 = encode_json_fields(br#"{"sensor":"temperature","value":"42"}"#).unwrap();
+        let f2 = encode_json_fields(br#"{"event":"earthquake","magnitude":"9.9"}"#).unwrap();
+        let b1 = build_master_bundle(&f1).unwrap();
+        let b2 = build_master_bundle(&f2).unwrap();
+        let cosine = b1.cosine(&b2) as f32;
+        let drift = (1.0 - cosine).max(0.0);
+        // Different bundles should have higher drift than identical ones
+        let self_drift = 1.0 - b1.cosine(&b1) as f32;
+        assert!(
+            drift > self_drift,
+            "different bundles drift={drift} should exceed self drift={self_drift}"
+        );
+    }
+
+    #[test]
+    fn test_window_bundle_warming_up_size() {
+        // Phase 2 requires 2 × WINDOW_N messages before producing temporal results.
+        // Before that, size < 2*WINDOW_N indicates warming up.
+        let required = 2 * WINDOW_N as u64;
+        assert_eq!(required, 40, "need 40 messages for Phase 2 warm-up");
+
+        // Simulate size counter growth
+        for msg in 1..=50u64 {
+            let size = msg.min(required);
+            if msg < required {
+                assert!(size < required, "msg={msg}: should still be warming up");
+            } else {
+                assert_eq!(size, required, "msg={msg}: should be at capacity");
+            }
+        }
     }
 }
