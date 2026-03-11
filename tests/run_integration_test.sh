@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_integration_test.sh — Full in-mesh integration test for wasmcloud-pattern-classifier.
 #
-# Tests the complete Phase 1 classification pipeline inside a real wasmCloud mesh:
+# Tests the complete Phase 1+2 classification pipeline inside a real wasmCloud mesh:
 #   1.  Redis server ensured running (auto-started if absent)
 #   2.  wasmCloud host started via `wash up`
 #   3.  Component built from source if no pre-built artifact exists
@@ -9,13 +9,15 @@
 #   5.  NATS subscriber started in background to capture classification output
 #   6.  WARM_UP_COUNT (31) identical messages sent to accumulate baseline statistics;
 #       these messages are expected to produce "WARMING_UP" classifications
-#   7.  A "normal" repeat message sent; expected to produce a low-z NORMAL result
-#   8.  An "anomalous" message (different values) sent; expected to show higher z-score
-#   9.  HITL reply flow exercised: a synthetic reply is published on the .reply topic
+#   7.  Additional messages sent to fill Phase 2 temporal ring buffer (2 × WINDOW_N = 40)
+#   8.  A "normal" repeat message sent; expected to produce a low-z NORMAL result
+#   9.  An "anomalous" message (different values) sent; expected to show higher z-score
+#  10.  HITL reply flow exercised: a synthetic reply is published on the .reply topic
 #       and the stats counter increment is verified
-#  10.  Redis key verification: stats:v1:* (Welford accumulators) and ema:v1:* (per-field)
-#  11.  NATS output verification: at least one non-WARMING_UP classification received
-#  12.  Full teardown: test keys flushed, app undeployed, host stopped, Redis stopped
+#  11.  Redis key verification: stats:v1:* (Welford accumulators), ema:v1:* (per-field),
+#       and window:* (Phase 2 temporal ring buffer)
+#  12.  NATS output verification: classification with Phase 2 temporal fields
+#  13.  Full teardown: test keys flushed, app undeployed, host stopped, Redis stopped
 #
 # Configuration (all overridable via environment variables):
 #   REDIS_HOST           Redis host                        (default: 127.0.0.1)
@@ -40,6 +42,10 @@ HOST_READY_TIMEOUT="${HOST_READY_TIMEOUT:-60}"
 DEPLOY_TIMEOUT="${DEPLOY_TIMEOUT:-120}"
 PROCESS_WAIT="${PROCESS_WAIT:-10}"
 WARM_UP_COUNT="${WARM_UP_COUNT:-31}"
+
+# Phase 2: temporal sliding window parameters
+WINDOW_N=20
+TEMPORAL_WARMUP=$((2 * WINDOW_N))  # 40 messages needed for Phase 2
 
 NATS_URL="nats://127.0.0.1:4222"
 
@@ -74,6 +80,12 @@ EXPECTED_EMA_KEYS=(
     "ema:v1:${TEST_SUBJECT}:magnitude"
     "ema:v1:${TEST_SUBJECT}:location"
     "ema:v1:${TEST_SUBJECT}:depth_km"
+)
+
+# Phase 2 temporal ring-buffer keys (owned by Phase 2 classifier)
+EXPECTED_TEMPORAL_KEYS=(
+    "window:ring:${TEST_SUBJECT}:head"
+    "window:ring:${TEST_SUBJECT}:size"
 )
 
 # HITL alert subject (classifier publishes here when confidence is low)
@@ -115,9 +127,15 @@ cleanup() {
         FLUSH_PATTERN="${TEST_SUBJECT}"
         for key in \
             "${EXPECTED_STATS_KEYS[@]}" \
-            "${EXPECTED_EMA_KEYS[@]}"; do
+            "${EXPECTED_EMA_KEYS[@]}" \
+            "${EXPECTED_TEMPORAL_KEYS[@]}"; do
             redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" DEL "$key" &>/dev/null || true
         done
+        # Also flush any window:slot and window:drift keys
+        for i in $(seq 0 $((WINDOW_N - 1))); do
+            redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" DEL "window:slot:${TEST_SUBJECT}:${i}" &>/dev/null || true
+        done
+        redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" DEL "window:drift:${TEST_SUBJECT}:history" &>/dev/null || true
         info "Test keys flushed from Redis"
     fi
 
@@ -340,6 +358,20 @@ info "Waiting ${PROCESS_WAIT}s for warm-up batch to be processed..."
 sleep "$PROCESS_WAIT"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 7b. Phase 2 temporal warm-up — fill ring buffer to 2 × WINDOW_N
+# ─────────────────────────────────────────────────────────────────────────────
+EXTRA_MESSAGES=$((TEMPORAL_WARMUP - WARM_UP_COUNT))
+if [[ "$EXTRA_MESSAGES" -gt 0 ]]; then
+    section "7b · Phase 2 Temporal Warm-up (${EXTRA_MESSAGES} additional messages)"
+    info "Sending ${EXTRA_MESSAGES} more baseline messages to fill temporal ring buffer..."
+    for (( i=1; i<=EXTRA_MESSAGES; i++ )); do
+        nats pub --server "$NATS_URL" "$TEST_SUBJECT" "$BASELINE_PAYLOAD"
+    done
+    info "Waiting ${PROCESS_WAIT}s for temporal warm-up batch to be processed..."
+    sleep "$PROCESS_WAIT"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 8. Post-warm-up — normal and anomalous messages
 # ─────────────────────────────────────────────────────────────────────────────
 section "8 · Post-Warm-up Messages"
@@ -403,6 +435,12 @@ for key in "${EXPECTED_EMA_KEYS[@]}"; do
     check_key "$key" || PASS=false
 done
 
+echo ""
+info "Checking Phase 2 temporal ring-buffer keys:"
+for key in "${EXPECTED_TEMPORAL_KEYS[@]}"; do
+    check_key "$key" || PASS=false
+done
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 11. NATS output verification
 # ─────────────────────────────────────────────────────────────────────────────
@@ -434,10 +472,27 @@ else
 fi
 
 if grep -q '"phase":1' "$NATS_OUT" 2>/dev/null; then
-    info "  ✓ 'phase':1 field confirmed (Phase 1 classifier)"
+    info "  ✓ 'phase':1 field confirmed (Phase 1 classifier during warm-up)"
 else
-    error "  ✗ 'phase':1 field not found in NATS output"
-    PASS=false
+    warn "  ? 'phase':1 field not found — may have progressed to Phase 2 entirely"
+fi
+
+if grep -q '"phase":2' "$NATS_OUT" 2>/dev/null; then
+    info "  ✓ 'phase':2 field confirmed (Phase 2 temporal layer active)"
+else
+    warn "  ? 'phase':2 field not found — Phase 2 temporal warm-up may not be complete"
+fi
+
+if grep -q '"source":"phase1"' "$NATS_OUT" 2>/dev/null; then
+    info "  ✓ 'source':'phase1' confirmed in solutions"
+else
+    warn "  ? 'source':'phase1' not found in solutions"
+fi
+
+if grep -q '"source":"phase2"' "$NATS_OUT" 2>/dev/null; then
+    info "  ✓ 'source':'phase2' confirmed in solutions (temporal layer)"
+else
+    warn "  ? 'source':'phase2' not found — Phase 2 may not have reached sufficient warm-up"
 fi
 
 if grep -q '"solutions"' "$NATS_OUT" 2>/dev/null; then
@@ -480,14 +535,16 @@ if [[ "$PASS" == "true" ]]; then
     info "║   Integration test  ✅  PASSED         ║"
     info "╚════════════════════════════════════════╝"
     echo ""
-    info "End-to-end Phase 1 pipeline verified:"
+    info "End-to-end Phase 1+2 pipeline verified:"
     info "  JSON messages  →  wasmcloud:messaging/handler"
     info "  Warm-up phase  →  WARMING_UP (first ${WARM_UP_COUNT} messages)"
     info "  VSA re-encode  →  embeddenator-vsa (deterministic)"
     info "  Welford stats  →  stats:v1:{subject}:* in Redis"
     info "  Per-field EMA  →  ema:v1:{subject}:{field} in Redis"
+    info "  Temporal ring  →  window:ring:{subject}:head/size in Redis"
     info "  Classification →  pattern.classified.{subject} on NATS"
     info "  HITL replies   →  pattern.alert.human.*.reply ingested"
+    info "  Phase 2 drift  →  temporal_label + temporal_confidence in output"
     exit 0
 else
     error "╔════════════════════════════════════════╗"

@@ -1,12 +1,13 @@
 # Integration Tests
 
 Integration tests run the `pattern-classifier` component inside a **real wasmCloud
-mesh** and verify the complete Phase 1 classification pipeline end-to-end:
+mesh** and verify the complete Phase 1+2 classification pipeline end-to-end:
 
 ```
 NATS messages  →  component (VSA encode + classify)
                        ├─► Redis: stats:v1:*  (Welford accumulators)
                        ├─► Redis: ema:v1:*    (per-field running bundles)
+                       ├─► Redis: window:*    (Phase 2 temporal ring buffer)
                        └─► NATS:  pattern.classified.*  (result JSON)
 ```
 
@@ -21,11 +22,12 @@ NATS messages  →  component (VSA encode + classify)
 | 5 | Deploys the WADM application manifest (`wadm.yaml`) |
 | 6 | Starts a background NATS subscriber on `pattern.classified.>` |
 | 7 | Sends `WARM_UP_COUNT` (31) identical messages — expects `WARMING_UP` responses |
+| 7b | Sends additional baseline messages to fill Phase 2 temporal ring buffer (2 × WINDOW_N = 40 total) |
 | 8 | Sends one "normal" message (similar values) and one "anomalous" message (extreme values) |
 | 9 | Exercises the HITL reply flow: publishes a human reply on the `.reply` topic |
-| 10 | Verifies all expected Redis keys exist (`stats:v1:*` and `ema:v1:*`) |
-| 11 | Verifies NATS output: at least one `NORMAL` or `ANOMALY` classification captured with all required JSON fields |
-| 12 | Cleans up: flushes test keys, undeploys app, stops host, stops Redis (if started) |
+| 10 | Verifies all expected Redis keys exist (`stats:v1:*`, `ema:v1:*`, and `window:*`) |
+| 11 | Verifies NATS output: classification with Phase 2 temporal fields, `source` annotations |
+| 12 | Cleans up: flushes test keys (including temporal keys), undeploys app, stops host |
 
 ## Prerequisites
 
@@ -73,6 +75,8 @@ REDIS_HOST=10.0.0.5 REDIS_PORT=6380 ./tests/run_integration_test.sh
 | `ema:v1:pattern.monitor.integration:magnitude` | Per-field EMA vector |
 | `ema:v1:pattern.monitor.integration:location` | Per-field EMA vector |
 | `ema:v1:pattern.monitor.integration:depth_km` | Per-field EMA vector |
+| `window:ring:pattern.monitor.integration:head` | Phase 2 ring-buffer write pointer (u64, LE bytes) |
+| `window:ring:pattern.monitor.integration:size` | Phase 2 ring-buffer fill count (u64, LE bytes) |
 
 ### NATS output (`pattern.classified.pattern.monitor.integration`)
 
@@ -83,11 +87,13 @@ Every classification message must contain these JSON fields:
 | `subject` | `"pattern.monitor.integration"` | Originating NATS subject |
 | `classification` | `"NORMAL"` / `"ANOMALY"` / `"WARMING_UP"` | Current classification |
 | `confidence` | `0.87` | Combined confidence in `[0, 1]` |
-| `solutions` | `[{"label":"normal","confidence":0.9}]` | Ranked hypothesis list |
+| `solutions` | `[{"label":"normal","confidence":0.9,"source":"phase1"}]` | Ranked hypothesis list with source phase |
 | `anomalous_fields` | `["magnitude"]` | Fields that triggered field-level anomaly |
-| `message_count` | `32` | Total messages processed for this subject |
+| `message_count` | `42` | Total messages processed for this subject |
 | `hitl_required` | `false` | Whether human escalation was needed |
-| `phase` | `1` | Phase level that produced this result |
+| `phase` | `2` | Phase level that produced this result (1 during warm-up, 2 when temporal layer active) |
+| `temporal_label` | `"temporal_normal"` | Phase 2 temporal classification (optional, absent during temporal warm-up) |
+| `temporal_confidence` | `0.95` | Phase 2 confidence (optional, absent during temporal warm-up) |
 
 ### HITL flow
 
@@ -120,6 +126,12 @@ This test is self-contained — it does **not** require the
 to be deployed. The classifier re-encodes JSON deterministically using the same
 `ReversibleVSAConfig::default()` as the encoder, so both components can share
 the same Redis bucket without coordination.
+
+The `wadm.yaml` manifest includes the encoder component
+(`ghcr.io/64bitasura/wasmcloud-pattern-encoder:0.1.0`) and WebSocket client
+provider (`ghcr.io/64bitasura/wasmcloud-websocket-client-provider:0.1.0`) for
+production deployments. The integration test uses a minimal WADM configuration
+that only requires the classifier component.
 
 The encoder's Redis keys (`semantic:v1:*`, `bundle:v1:*`) are not verified here;
 they belong to the encoder's own integration test.

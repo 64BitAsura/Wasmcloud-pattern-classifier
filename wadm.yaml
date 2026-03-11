@@ -3,11 +3,14 @@ kind: Application
 metadata:
   name: pattern-classifier-app
   annotations:
-    version: v0.1.0
+    version: v0.2.0
     description: >
-      wasmCloud pattern-classifier (Phase 1): classifies patterns and anomalies
-      in real-time from streaming JSON messages using VSA cosine statistics and
-      per-field semantic drift detection, with human-in-the-loop escalation.
+      wasmCloud pattern-classifier (Phase 2): classifies patterns and anomalies
+      in real-time from streaming JSON messages using VSA cosine statistics,
+      per-field semantic drift detection, and sliding-window temporal drift
+      analysis, with human-in-the-loop escalation.  Includes the pattern-encoder
+      component for VSA vector encoding and a WebSocket client provider for
+      live seismic data ingestion.
 spec:
   components:
     # ── Pattern-classifier component ─────────────────────────────────────────
@@ -44,6 +47,29 @@ spec:
             package: messaging
             interfaces: [consumer]
 
+    # ── Pattern-encoder component (VSA vector encoding) ──────────────────────
+    - name: pattern-encoder
+      type: component
+      properties:
+        image: ghcr.io/64bitasura/wasmcloud-pattern-encoder:0.1.0
+      traits:
+        - type: spreadscaler
+          properties:
+            instances: 1
+
+        # Link to Redis key-value provider (shared bucket with the classifier)
+        - type: link
+          properties:
+            target:
+              name: redis-keyvalue
+              config:
+                - name: keyvalue-config
+                  properties:
+                    url: redis://127.0.0.1:6379
+            namespace: wasi
+            package: keyvalue
+            interfaces: [store]
+
     # ── NATS messaging capability provider ──────────────────────────────────
     - name: nats-messaging
       type: capability
@@ -66,6 +92,45 @@ spec:
                 - name: messaging-config
                   properties:
                     subscriptions: "pattern.monitor.>, pattern.alert.human.*.reply"
+
+        # Link from NATS provider to the encoder component (handler).
+        # The encoder processes incoming messages on the same stream topics.
+        - type: link
+          properties:
+            target:
+              name: pattern-encoder
+            namespace: wasmcloud
+            package: messaging
+            interfaces: [handler]
+            source:
+              config:
+                - name: encoder-messaging-config
+                  properties:
+                    subscriptions: "pattern.monitor.>"
+
+    # ── WebSocket client capability provider (seismic data ingestion) ────────
+    - name: websocket-client
+      type: capability
+      properties:
+        image: ghcr.io/64bitasura/wasmcloud-websocket-client-provider:0.1.0
+        id: websocket-client
+      traits:
+        # Link from WebSocket provider to NATS messaging provider.
+        # The WebSocket provider connects to the seismic data stream and
+        # publishes received messages to the pattern.monitor.> NATS subjects.
+        - type: link
+          properties:
+            target:
+              name: nats-messaging
+            namespace: wasmcloud
+            package: messaging
+            interfaces: [consumer]
+            source:
+              config:
+                - name: websocket-config
+                  properties:
+                    url: "wss://www.seismicportal.eu/standing_order/websocket"
+                    subject_prefix: "pattern.monitor.seismic"
 
     # ── Redis key-value capability provider ─────────────────────────────────
     - name: redis-keyvalue
