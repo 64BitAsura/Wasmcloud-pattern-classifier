@@ -371,9 +371,8 @@ NATS: pattern.monitor.{subject}
 
 1. ~~**Confirm this design**~~ ✅
 2. ~~**Implement Phase 1**~~ ✅ — implemented in `component/src/lib.rs`; 22 unit tests pass.
-3. **Validate Phase 1** end-to-end against a running encoder in a local
-   wasmCloud host.
-4. **Layer Phase 2** once Phase 1 is stable and producing useful signals.
+3. ~~**Validate Phase 1**~~ ✅ — end-to-end integration test passes in local wasmCloud host.
+4. ~~**Layer Phase 2**~~ ✅ — implemented sliding-window temporal drift detection; 12 additional unit tests pass (34 total).
 5. **Evaluate Phase 3** need based on observed HITL escalation rate from
    Phase 1+2 in production.
 
