@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Build & Publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wash CLI
+        run: |
+          curl -s "https://packagecloud.io/install/repositories/wasmcloud/core/script.deb.sh" | sudo bash
+          sudo apt-get install -y wash
+
+      - name: Build component
+        run: wash build -p ./component
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Push component to GHCR (versioned)
+        env:
+          WASH_REG_USER: ${{ github.actor }}
+          WASH_REG_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          wash push ghcr.io/${{ github.repository_owner }}/pattern-classifier-component:${{ steps.version.outputs.version }} \
+            component/build/pattern_classifier_s.wasm
+
+      - name: Push component to GHCR (latest)
+        env:
+          WASH_REG_USER: ${{ github.actor }}
+          WASH_REG_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          wash push --allow-latest \
+            ghcr.io/${{ github.repository_owner }}/pattern-classifier-component:latest \
+            component/build/pattern_classifier_s.wasm
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            component/build/*.wasm
